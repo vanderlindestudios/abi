@@ -20,11 +20,9 @@ const headers = {
     "Content-Type": "application/json"
 };
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function request(url, options = {}, retries = 3) {
+async function request(url, options = {}, retries = 4) {
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
             const response = await fetch(url, {
@@ -37,8 +35,7 @@ async function request(url, options = {}, retries = 3) {
 
             const text = await response.text();
 
-            let data = null;
-
+            let data;
             try {
                 data = text ? JSON.parse(text) : null;
             } catch {
@@ -47,17 +44,18 @@ async function request(url, options = {}, retries = 3) {
 
             if (response.ok) {
                 return {
-                    success: true,
+                    ok: true,
                     status: response.status,
                     data
                 };
             }
 
             if (response.status === 429) {
-                const retryAfter = Number(response.headers.get("retry-after")) || 5;
+                const retryAfter =
+                    Number(response.headers.get("retry-after")) || 5;
 
                 console.log(
-                    `Rate limit. ${retryAfter} saniye bekleniyor...`
+                    `[RATE LIMIT] ${retryAfter} saniye bekleniyor...`
                 );
 
                 await sleep(retryAfter * 1000);
@@ -70,14 +68,14 @@ async function request(url, options = {}, retries = 3) {
             }
 
             return {
-                success: false,
+                ok: false,
                 status: response.status,
                 data
             };
         } catch (error) {
-            if (attempt >= retries) {
+            if (attempt === retries) {
                 return {
-                    success: false,
+                    ok: false,
                     status: 0,
                     data: error.message
                 };
@@ -88,191 +86,166 @@ async function request(url, options = {}, retries = 3) {
     }
 
     return {
-        success: false,
+        ok: false,
         status: 0,
         data: "Unknown error"
     };
 }
 
-async function getRoles() {
-    const roles = [];
-    let pageToken = "";
+function extractId(value) {
+    if (value === undefined || value === null) {
+        return null;
+    }
 
-    while (true) {
-        const url = new URL(
-            `${BASE_URL}/groups/${GROUP_ID}/roles`
-        );
+    if (typeof value === "number") {
+        return String(value);
+    }
 
-        url.searchParams.set("pageSize", "100");
-
-        if (pageToken) {
-            url.searchParams.set("pageToken", pageToken);
+    if (typeof value === "object") {
+        if (value.id !== undefined) {
+            return String(value.id);
         }
 
-        const result = await request(url.toString());
-
-        if (!result.success) {
-            throw new Error(
-                `Roller alınamadı: ${result.status} ${JSON.stringify(result.data)}`
-            );
+        if (value.name !== undefined) {
+            return extractId(value.name);
         }
 
-        const pageRoles = result.data?.groupRoles || [];
-
-        roles.push(...pageRoles);
-
-        pageToken = result.data?.nextPageToken || "";
-
-        if (!pageToken) {
-            break;
+        if (value.path !== undefined) {
+            return extractId(value.path);
         }
     }
 
-    return roles;
-}
+    const match = String(value).match(/(?:users|roles|memberships)\/([^/]+)$/);
 
-async function getMemberships() {
-    const memberships = [];
-    let pageToken = "";
-
-    while (true) {
-        const url = new URL(
-            `${BASE_URL}/groups/${GROUP_ID}/memberships`
-        );
-
-        url.searchParams.set("pageSize", "100");
-
-        if (pageToken) {
-            url.searchParams.set("pageToken", pageToken);
-        }
-
-        const result = await request(url.toString());
-
-        if (!result.success) {
-            throw new Error(
-                `Üyeler alınamadı: ${result.status} ${JSON.stringify(result.data)}`
-            );
-        }
-
-        const pageMemberships = result.data?.groupMemberships || [];
-
-        memberships.push(...pageMemberships);
-
-        pageToken = result.data?.nextPageToken || "";
-
-        if (!pageToken) {
-            break;
-        }
-    }
-
-    return memberships;
+    return match ? match[1] : null;
 }
 
 function getRoleId(role) {
     if (!role) return null;
 
-    if (typeof role === "string") {
-        const match = role.match(/roles\/(\d+)/);
-        return match ? match[1] : null;
-    }
+    return extractId(
+        role.id ??
+        role.name ??
+        role.path
+    );
+}
 
-    if (role.role) {
-        return getRoleId(role.role);
-    }
+function getMembershipId(membership) {
+    if (!membership) return null;
 
-    if (role.name && role.id) {
-        return String(role.id);
-    }
+    return extractId(
+        membership.id ??
+        membership.name ??
+        membership.path
+    );
+}
 
-    if (role.id) {
-        return String(role.id);
-    }
+function getUserId(membership) {
+    if (!membership) return null;
 
-    if (role.roleId) {
-        return String(role.roleId);
-    }
-
-    return null;
+    return extractId(
+        membership.userId ??
+        membership.user?.id ??
+        membership.user?.name ??
+        membership.user
+    );
 }
 
 function getMembershipRoleId(membership) {
     if (!membership) return null;
 
-    if (membership.role) {
-        return getRoleId(membership.role);
-    }
-
-    if (membership.roleId) {
-        return String(membership.roleId);
-    }
-
-    return null;
+    return getRoleId(
+        membership.role ??
+        membership.roleId
+    );
 }
 
-function getUserId(membership) {
-    if (membership.user?.split("/").length) {
-        const match = String(membership.user).match(/users\/(\d+)/);
+async function getAllPages(endpoint, collectionNames) {
+    const results = [];
+    let pageToken = "";
 
-        if (match) {
-            return match[1];
+    while (true) {
+        const url = new URL(`${BASE_URL}${endpoint}`);
+
+        url.searchParams.set("maxPageSize", "100");
+
+        if (pageToken) {
+            url.searchParams.set("pageToken", pageToken);
+        }
+
+        const result = await request(url.toString());
+
+        if (!result.ok) {
+            throw new Error(
+                `${result.status}: ${JSON.stringify(result.data)}`
+            );
+        }
+
+        let items = [];
+
+        for (const name of collectionNames) {
+            if (Array.isArray(result.data?.[name])) {
+                items = result.data[name];
+                break;
+            }
+        }
+
+        results.push(...items);
+
+        pageToken =
+            result.data?.nextPageToken ||
+            result.data?.next_page_token ||
+            "";
+
+        if (!pageToken) {
+            break;
         }
     }
 
-    if (membership.userId) {
-        return String(membership.userId);
-    }
-
-    return null;
+    return results;
 }
 
-function getMembershipId(membership) {
-    if (membership.name) {
-        const match = String(membership.name).match(
-            /memberships\/([^/]+)$/
-        );
-
-        if (match) {
-            return match[1];
-        }
-
-        return String(membership.name).split("/").pop();
-    }
-
-    if (membership.membershipId) {
-        return String(membership.membershipId);
-    }
-
-    if (membership.id) {
-        return String(membership.id);
-    }
-
-    return null;
+async function getRoles() {
+    return getAllPages(
+        `/groups/${GROUP_ID}/roles`,
+        ["groupRoles", "roles"]
+    );
 }
 
-async function getUsername(userId) {
+async function getMemberships() {
+    return getAllPages(
+        `/groups/${GROUP_ID}/memberships`,
+        ["groupMemberships", "memberships"]
+    );
+}
+
+async function getUserName(userId) {
     if (!userId) return "Unknown";
 
     const result = await request(
         `${BASE_URL}/users/${userId}`
     );
 
-    if (!result.success) {
+    if (!result.ok) {
         return userId;
     }
 
-    return result.data?.displayName ||
+    return (
+        result.data?.displayName ||
         result.data?.name ||
-        userId;
+        userId
+    );
 }
 
-async function demoteMember(membershipId, targetRoleId) {
+async function assignRole(membershipId, roleId) {
     const url =
-        `${BASE_URL}/groups/${GROUP_ID}/memberships/${membershipId}`;
+        `${BASE_URL}/groups/${GROUP_ID}` +
+        `/memberships/${membershipId}:assignRole`;
 
-    return await request(url, {
-        method: "PATCH",
+    return request(url, {
+        method: "POST",
         body: JSON.stringify({
-            role: `groups/${GROUP_ID}/roles/${targetRoleId}`
+            role: `groups/${GROUP_ID}/roles/${roleId}`
         })
     });
 }
@@ -285,44 +258,52 @@ async function main() {
     console.log(`Group ID: ${GROUP_ID}`);
     console.log("");
 
-    console.log("[1/3] Grup rolleri alınıyor...");
+    console.log("[1/3] Roller alınıyor...");
 
     const roles = await getRoles();
 
     if (!roles.length) {
-        throw new Error("Hiç rol bulunamadı.");
+        throw new Error("Grup rolleri alınamadı.");
     }
 
-    roles.sort((a, b) => {
-        return Number(a.rank || 0) - Number(b.rank || 0);
-    });
-
-    console.log(`Toplam rol: ${roles.length}`);
-
-    const roleMap = new Map();
+    const normalizedRoles = [];
 
     for (const role of roles) {
         const roleId = getRoleId(role);
+        const rank = Number(role.rank ?? 0);
 
-        if (!roleId) continue;
+        if (!roleId || !Number.isFinite(rank)) {
+            continue;
+        }
 
-        roleMap.set(roleId, role);
+        normalizedRoles.push({
+            id: roleId,
+            rank,
+            name:
+                role.displayName ||
+                role.name ||
+                roleId
+        });
     }
 
+    normalizedRoles.sort((a, b) => a.rank - b.rank);
+
+    console.log(`Toplam rol: ${normalizedRoles.length}`);
     console.log("");
-    console.log("[2/3] Grup üyeleri alınıyor...");
+
+    console.log("[2/3] Üyeler alınıyor...");
 
     const memberships = await getMemberships();
 
     console.log(`Toplam üyelik: ${memberships.length}`);
     console.log("");
 
+    console.log("[3/3] Üyeler işleniyor...");
+    console.log("");
+
     let successCount = 0;
     let skippedCount = 0;
     let errorCount = 0;
-
-    console.log("[3/3] Üyeler işleniyor...");
-    console.log("");
 
     for (let i = 0; i < memberships.length; i++) {
         const membership = memberships[i];
@@ -334,92 +315,89 @@ async function main() {
 
             if (!membershipId || !userId || !currentRoleId) {
                 console.log(
-                    `[SKIP] ${i + 1}/${memberships.length} - Üyelik bilgisi eksik`
+                    `[SKIP] ${i + 1}/${memberships.length} - ` +
+                    `Üyelik bilgisi eksik`
                 );
 
                 skippedCount++;
                 continue;
             }
 
-            const currentRole = roleMap.get(currentRoleId);
+            const currentRole = normalizedRoles.find(
+                role => role.id === currentRoleId
+            );
 
             if (!currentRole) {
                 console.log(
-                    `[SKIP] ${i + 1}/${memberships.length} - Rol bulunamadı (${currentRoleId})`
+                    `[SKIP] ${i + 1}/${memberships.length} - ` +
+                    `Mevcut rol bulunamadı (${currentRoleId})`
                 );
 
                 skippedCount++;
                 continue;
             }
 
-            const currentRank = Number(currentRole.rank || 0);
-
-            if (currentRank <= 0) {
+            if (currentRole.rank <= 1) {
                 console.log(
-                    `[SKIP] ${i + 1}/${memberships.length} - ${userId} zaten en düşük rütbede`
+                    `[SKIP] ${i + 1}/${memberships.length} - ` +
+                    `${userId} zaten en düşük rütbede`
                 );
 
                 skippedCount++;
                 continue;
             }
 
-            const lowerRoles = roles.filter(role => {
-                const rank = Number(role.rank || 0);
-
-                return rank < currentRank && rank > 0;
-            });
+            const lowerRoles = normalizedRoles.filter(
+                role =>
+                    role.rank > 0 &&
+                    role.rank < currentRole.rank
+            );
 
             if (!lowerRoles.length) {
                 console.log(
-                    `[SKIP] ${i + 1}/${memberships.length} - ${userId} için alt rütbe yok`
+                    `[SKIP] ${i + 1}/${memberships.length} - ` +
+                    `${userId} için alt rütbe bulunamadı`
                 );
 
                 skippedCount++;
                 continue;
             }
 
-            const targetRole = lowerRoles[lowerRoles.length - 1];
-            const targetRoleId = getRoleId(targetRole);
+            const targetRole =
+                lowerRoles[lowerRoles.length - 1];
 
-            if (!targetRoleId) {
-                console.log(
-                    `[SKIP] ${i + 1}/${memberships.length} - Hedef rol ID bulunamadı`
-                );
-
-                skippedCount++;
-                continue;
-            }
-
-            const username = await getUsername(userId);
+            const username = await getUserName(userId);
 
             console.log(
-                `[${i + 1}/${memberships.length}] ${username} | ` +
-                `${currentRole.displayName || currentRole.name || currentRoleId} -> ` +
-                `${targetRole.displayName || targetRole.name || targetRoleId}`
+                `[${i + 1}/${memberships.length}] ` +
+                `${username} | ` +
+                `${currentRole.name} -> ${targetRole.name}`
             );
 
-            const result = await demoteMember(
+            const result = await assignRole(
                 membershipId,
-                targetRoleId
+                targetRole.id
             );
 
-            if (!result.success) {
+            if (!result.ok) {
                 console.log(
-                    `   [ERROR] Atlandı: ${result.status} ${JSON.stringify(result.data)}`
+                    `   [ERROR] Atlandı | ` +
+                    `${result.status} | ` +
+                    `${JSON.stringify(result.data)}`
                 );
 
                 errorCount++;
                 continue;
             }
 
-            console.log("   [OK] Rütbe düşürüldü.");
+            console.log("   [OK] Bir alt rütbeye indirildi.");
 
             successCount++;
 
-            await sleep(250);
+            await sleep(300);
         } catch (error) {
             console.log(
-                `   [ERROR] Üye atlandı: ${error.message}`
+                `   [ERROR] Üye atlandı | ${error.message}`
             );
 
             errorCount++;
